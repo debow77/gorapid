@@ -6,6 +6,7 @@
 package gorapid
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,17 @@ import (
 	"strings"
 	"time"
 )
+
+type JSONBody interface {
+	RapidJson() ([]byte, error)
+}
+
+type Response struct {
+	Body    []byte
+	Status  int
+	Headers http.Header
+	Error   error
+}
 
 // Token represents a RAPID API authentication token.
 type Token struct {
@@ -49,12 +61,13 @@ func (t *Token) IsValid() bool {
 
 // RapidClient represents a client for interacting with the RAPID API.
 type RapidClient struct {
-	BaseURL      string
-	Key          string
-	Secret       string
-	UserWebToken string
-	HTTPClient   *http.Client
-	Token        *Token
+	BaseURL        string
+	Key            string
+	Secret         string
+	UserWebToken   string
+	HTTPClient     *http.Client
+	Token          *Token
+	XAuthorization string
 }
 
 // NewRapidClient creates a new RapidClient instance using environment variables.
@@ -181,7 +194,8 @@ func (c *RapidClient) generateParameters() url.Values {
 // The method automatically handles token generation and refresh as needed.
 // It accepts HTTP method, URL path, request body, and query parameters.
 // It returns the response body as a byte slice or an error if the request fails.
-func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) ([]byte, error) {
+// func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) ([]byte, error) {
+func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) (*Response, error) {
 	if c.Token == nil || !c.Token.IsValid() {
 		if err := c.GenerateToken(); err != nil {
 			return nil, fmt.Errorf("error generating token: %w", err)
@@ -194,20 +208,35 @@ func (c *RapidClient) Request(method, urlPath string, body interface{}, params u
 	}
 
 	var reqBody []byte
+	var err error
 	if body != nil {
-		var err error
-		reqBody, err = json.Marshal(body)
+		if jsonBody, ok := body.(JSONBody); ok {
+			reqBody, err = jsonBody.RapidJson()
+		} else {
+			reqBody, err = json.Marshal(body)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling request body: %w", err)
 		}
 	}
 
-	req, err := http.NewRequest(method, fullURL, strings.NewReader(string(reqBody)))
+	var req *http.Request
+	if body != nil {
+		req, err = http.NewRequest(method, fullURL, bytes.NewBuffer(reqBody))
+	} else {
+		req, err = http.NewRequest(method, fullURL, nil)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/json")
+
+	// Required for JIRA API
+	if c.XAuthorization != "" {
+		req.Header.Set("X-Authorization", c.XAuthorization)
+	}
+
 	req.Header.Set("Authorization", c.Token.GetAuthorizationHeader())
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -219,34 +248,36 @@ func (c *RapidClient) Request(method, urlPath string, body interface{}, params u
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 
-	return respBody, nil
+	// return respBody, nil
+	return &Response{
+		Body:    respBody,
+		Status:  resp.StatusCode,
+		Headers: resp.Header,
+		Error:   err,
+	}, nil
 }
 
 // Get performs an HTTP GET request to the specified API endpoint.
-func (c *RapidClient) Get(urlPath string, params url.Values) ([]byte, error) {
+func (c *RapidClient) Get(urlPath string, params url.Values) (*Response, error) {
 	return c.Request(http.MethodGet, urlPath, nil, params)
 }
 
 // Post performs an HTTP POST request to the specified API endpoint.
-func (c *RapidClient) Post(urlPath string, body interface{}) ([]byte, error) {
+func (c *RapidClient) Post(urlPath string, body JSONBody) (*Response, error) {
 	return c.Request(http.MethodPost, urlPath, body, nil)
 }
 
 // Put performs an HTTP PUT request to the specified API endpoint.
-func (c *RapidClient) Put(urlPath string, body interface{}) ([]byte, error) {
+func (c *RapidClient) Put(urlPath string, body JSONBody) (*Response, error) {
 	return c.Request(http.MethodPut, urlPath, body, nil)
 }
 
 // Delete performs an HTTP DELETE request to the specified API endpoint.
-func (c *RapidClient) Delete(urlPath string) ([]byte, error) {
+func (c *RapidClient) Delete(urlPath string) (*Response, error) {
 	return c.Request(http.MethodDelete, urlPath, nil, nil)
 }
