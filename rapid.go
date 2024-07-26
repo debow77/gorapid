@@ -1,14 +1,10 @@
-// Package rapid provides a client for interacting with the RAPID API.
-//
-// It handles authentication, token management, and provides methods for
-// making HTTP requests to the API endpoints. The client uses environment
-// variables for configuration to keep sensitive information out of the code.
 package gorapid
 
 import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,10 +14,12 @@ import (
 	"time"
 )
 
+// JSONBody defines an interface for types that can be converted to JSON.
 type JSONBody interface {
 	RapidJson() ([]byte, error)
 }
 
+// Response represents the structure of an HTTP response.
 type Response struct {
 	Body    []byte
 	Status  int
@@ -39,7 +37,7 @@ type Token struct {
 }
 
 // NewToken creates a new Token instance.
-func NewToken(value string, expiresIn int, tokenType string, refreshToken string) *Token {
+func NewToken(value string, expiresIn int, tokenType, refreshToken string) *Token {
 	return &Token{
 		Value:        value,
 		ExpiresIn:    expiresIn,
@@ -71,16 +69,6 @@ type RapidClient struct {
 }
 
 // NewRapidClient creates a new RapidClient instance using environment variables.
-//
-// The following environment variables are used:
-//   - RAPID_BASE_URL: The base URL for the RAPID API (required).
-//   - RAPID_KEY: The API key for authentication (required).
-//   - RAPID_SECRET: The API secret for authentication (required).
-//   - RAPID_USER_WEB_TOKEN: The user web token for authentication (optional).
-//
-// Returns:
-//   - A new RapidClient instance and nil error on success.
-//   - nil and an error if the required environment variables are not set.
 func NewRapidClient() (*RapidClient, error) {
 	baseURL := os.Getenv("RAPID_BASE_URL")
 	key := os.Getenv("RAPID_KEY")
@@ -88,7 +76,7 @@ func NewRapidClient() (*RapidClient, error) {
 	userWebToken := os.Getenv("RAPID_USER_WEB_TOKEN")
 
 	if baseURL == "" || key == "" || secret == "" {
-		return nil, fmt.Errorf("RAPID_BASE_URL, RAPID_KEY, and RAPID_SECRET environment variables must be set")
+		return nil, errors.New("RAPID_BASE_URL, RAPID_KEY, and RAPID_SECRET environment variables must be set")
 	}
 
 	return &RapidClient{
@@ -105,7 +93,7 @@ func (c *RapidClient) GenerateToken() error {
 	params := c.generateParameters()
 	tokenURL := c.BaseURL + "/token"
 
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(params.Encode()))
+	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -147,7 +135,7 @@ func (c *RapidClient) RefreshToken() error {
 
 	tokenURL := c.BaseURL + "/token"
 
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(params.Encode()))
+	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -191,10 +179,7 @@ func (c *RapidClient) generateParameters() url.Values {
 }
 
 // Request performs a generic RAPID request against the base API URL.
-// The method automatically handles token generation and refresh as needed.
-// It accepts HTTP method, URL path, request body, and query parameters.
-// It returns the response body as a byte slice or an error if the request fails.
-// func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) ([]byte, error) {
+// It handles token generation and refresh as needed and returns the response.
 func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) (*Response, error) {
 	if c.Token == nil || !c.Token.IsValid() {
 		if err := c.GenerateToken(); err != nil {
@@ -231,12 +216,9 @@ func (c *RapidClient) Request(method, urlPath string, body interface{}, params u
 	}
 
 	req.Header.Set("Accept", "application/json")
-
-	// Required for JIRA API
 	if c.XAuthorization != "" {
 		req.Header.Set("X-Authorization", c.XAuthorization)
 	}
-
 	req.Header.Set("Authorization", c.Token.GetAuthorizationHeader())
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -253,7 +235,6 @@ func (c *RapidClient) Request(method, urlPath string, body interface{}, params u
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 
-	// return respBody, nil
 	return &Response{
 		Body:    respBody,
 		Status:  resp.StatusCode,
