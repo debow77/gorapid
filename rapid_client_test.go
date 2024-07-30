@@ -2,6 +2,7 @@ package gorapid
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -189,8 +190,15 @@ func TestRequest(t *testing.T) {
 		t.Fatalf("Expected response to be non-nil")
 	}
 
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Expected no error reading response body, got %v", err)
+	}
+
 	var responseMap map[string]string
-	err = json.Unmarshal(resp, &responseMap)
+	err = json.Unmarshal(body, &responseMap)
 	if err != nil {
 		t.Fatalf("Expected no error unmarshalling response, got %v", err)
 	}

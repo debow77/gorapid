@@ -10,9 +10,38 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
+
+const (
+	contentTypeJSON        = "application/json"
+	contentTypeURLEncoded  = "application/x-www-form-urlencoded"
+	authorizationHeader    = "Authorization"
+	xAuthorizationHeader   = "X-Authorization"
+	acceptHeader           = "Accept"
+	defaultTimeout         = 600 * time.Second
+	tokenEndpoint          = "/token"
+	clientCredentialsGrant = "client_credentials"
+	jwtBearerGrant         = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+)
+
+// Custom errors
+var (
+	ErrInvalidConfig    = errors.New("invalid configuration: base URL, key, and secret must be provided")
+	ErrTokenGeneration  = errors.New("failed to generate token")
+	ErrUnexpectedStatus = errors.New("unexpected status code")
+)
+
+// Config holds the configuration for RapidClient
+type Config struct {
+	BaseURL      string
+	Key          string
+	Secret       string
+	UserWebToken string
+	Timeout      time.Duration
+}
 
 // JSONBody defines an interface for types that can be converted to JSON.
 type JSONBody interface {
@@ -21,10 +50,20 @@ type JSONBody interface {
 
 // Response represents the structure of an HTTP response.
 type Response struct {
-	Body    []byte
-	Status  int
-	Headers http.Header
-	Error   error
+	Body         io.ReadCloser
+	Status       int
+	Headers      http.Header
+	Error        error
+	ResponseTime time.Duration
+	RequestURL   string
+}
+
+type readOnlyBytes struct {
+	*bytes.Reader
+}
+
+func (r *readOnlyBytes) Close() error {
+	return nil
 }
 
 // Token represents a RAPID API authentication token.
@@ -68,7 +107,7 @@ type RapidClient struct {
 	XAuthorization string
 }
 
-// NewRapidClient creates a new RapidClient instance using environment variables.
+// NewRapidClient creates a new RapidClient instance using environment variables
 func NewRapidClient() (*RapidClient, error) {
 	baseURL := os.Getenv("RAPID_BASE_URL")
 	key := os.Getenv("RAPID_KEY")
@@ -76,7 +115,7 @@ func NewRapidClient() (*RapidClient, error) {
 	userWebToken := os.Getenv("RAPID_USER_WEB_TOKEN")
 
 	if baseURL == "" || key == "" || secret == "" {
-		return nil, errors.New("RAPID_BASE_URL, RAPID_KEY, and RAPID_SECRET environment variables must be set")
+		return nil, ErrInvalidConfig
 	}
 
 	return &RapidClient{
@@ -84,78 +123,45 @@ func NewRapidClient() (*RapidClient, error) {
 		Key:          key,
 		Secret:       secret,
 		UserWebToken: userWebToken,
-		HTTPClient:   &http.Client{Timeout: 600 * time.Second},
+		HTTPClient:   &http.Client{Timeout: defaultTimeout},
 	}, nil
 }
 
 // GenerateToken generates a new RAPID Bearer token.
 func (c *RapidClient) GenerateToken() error {
-	params := c.generateParameters()
-	tokenURL := c.BaseURL + "/token"
-
-	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(params.Encode()))
-	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.Key+":"+c.Secret)))
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var token Token
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
-	}
-
-	token.ExpireTime = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
-	c.Token = &token
-
-	return nil
+	return c.generateOrRefreshToken(false)
 }
 
 // RefreshToken refreshes an expired RAPID Bearer token.
 func (c *RapidClient) RefreshToken() error {
-	if c.Token == nil || c.Token.RefreshToken == "" {
-		return c.GenerateToken()
-	}
+	return c.generateOrRefreshToken(true)
+}
 
-	params := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {c.Token.RefreshToken},
-	}
-
-	tokenURL := c.BaseURL + "/token"
+func (c *RapidClient) generateOrRefreshToken(isRefresh bool) error {
+	params := c.generateParameters(isRefresh)
+	tokenURL := c.BaseURL + tokenEndpoint
 
 	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(params.Encode()))
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
+		return fmt.Errorf("%w: %v", ErrTokenGeneration, err)
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.Key+":"+c.Secret)))
+	req.Header.Set("Content-Type", contentTypeURLEncoded)
+	req.Header.Set(authorizationHeader, "Basic "+base64.StdEncoding.EncodeToString([]byte(c.Key+":"+c.Secret)))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("error sending request: %w", err)
+		return fmt.Errorf("%w: %v", ErrTokenGeneration, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("%w: %d", ErrUnexpectedStatus, resp.StatusCode)
 	}
 
 	var token Token
 	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
+		return fmt.Errorf("%w: %v", ErrTokenGeneration, err)
 	}
 
 	token.ExpireTime = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
@@ -165,81 +171,92 @@ func (c *RapidClient) RefreshToken() error {
 }
 
 // generateParameters generates the parameters for token requests.
-func (c *RapidClient) generateParameters() url.Values {
+func (c *RapidClient) generateParameters(isRefresh bool) url.Values {
+	if isRefresh && c.Token != nil && c.Token.RefreshToken != "" {
+		return url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {c.Token.RefreshToken},
+		}
+	}
 	if c.UserWebToken != "" {
 		return url.Values{
-			"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			"grant_type": {jwtBearerGrant},
 			"assertion":  {c.UserWebToken},
 		}
 	}
 	return url.Values{
-		"grant_type": {"client_credentials"},
+		"grant_type": {clientCredentialsGrant},
 		"scope":      {"am_application_scope,default"},
 	}
+}
+
+// ensureValidToken checks if the current token is valid and generates a new one if necessary.
+func (c *RapidClient) ensureValidToken() error {
+	if c.Token != nil && c.Token.IsValid() {
+		return nil
+	}
+	return c.GenerateToken()
 }
 
 // Request performs a generic RAPID request against the base API URL.
 // It handles token generation and refresh as needed and returns the response.
 func (c *RapidClient) Request(method, urlPath string, body interface{}, params url.Values) (*Response, error) {
-	if c.Token == nil || !c.Token.IsValid() {
-		if err := c.GenerateToken(); err != nil {
-			return nil, fmt.Errorf("error generating token: %w", err)
-		}
+	if err := c.ensureValidToken(); err != nil {
+		return nil, fmt.Errorf("error ensuring valid token: %w", err)
 	}
 
-	fullURL := c.BaseURL + "/" + strings.TrimLeft(urlPath, "/")
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing base URL: %w", err)
+	}
+	// u.Path = path.Join(u.Path, urlPath)
+	u.Path = filepath.Join(u.Path, urlPath)
 	if len(params) > 0 {
-		fullURL += "?" + params.Encode()
+		u.RawQuery = params.Encode()
 	}
 
-	var reqBody []byte
-	var err error
+	var reqBody io.ReadCloser
 	if body != nil {
+		var buf []byte
 		if jsonBody, ok := body.(JSONBody); ok {
-			reqBody, err = jsonBody.RapidJson()
+			buf, err = jsonBody.RapidJson()
 		} else {
-			reqBody, err = json.Marshal(body)
+			buf, err = json.Marshal(body)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling request body: %w", err)
 		}
+		reqBody = &readOnlyBytes{bytes.NewReader(buf)}
 	}
 
-	var req *http.Request
-	if body != nil {
-		req, err = http.NewRequest(method, fullURL, bytes.NewBuffer(reqBody))
-	} else {
-		req, err = http.NewRequest(method, fullURL, nil)
-	}
+	req, err := http.NewRequest(method, u.String(), reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set(acceptHeader, contentTypeJSON)
 	if c.XAuthorization != "" {
-		req.Header.Set("X-Authorization", c.XAuthorization)
+		req.Header.Set(xAuthorizationHeader, c.XAuthorization)
 	}
-	req.Header.Set("Authorization", c.Token.GetAuthorizationHeader())
+	req.Header.Set(authorizationHeader, c.Token.GetAuthorizationHeader())
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentTypeJSON)
 	}
 
+	start := time.Now()
 	resp, err := c.HTTPClient.Do(req)
+	duration := time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("error sending request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
 
 	return &Response{
-		Body:    respBody,
-		Status:  resp.StatusCode,
-		Headers: resp.Header,
-		Error:   err,
+		Body:         resp.Body,
+		Status:       resp.StatusCode,
+		Headers:      resp.Header,
+		Error:        err,
+		ResponseTime: duration,
+		RequestURL:   u.String(),
 	}, nil
 }
 
